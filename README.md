@@ -36,6 +36,8 @@ import requests
 # Each trade uses 50 USDT of margin at 10× leverage (~500 USDT notional)
 TRADE_MARGIN_USD = 50.0
 LEVERAGE = 10
+# Maximum number of simultaneous open trades
+MAX_OPEN_TRADES = 2
 
 # =========================
 # Helpers
@@ -123,9 +125,6 @@ class Config:
     scalp_sl_atr_mult: float = 0.8
     scalp_bb_k: float = 2.0
     debug_signals: bool = False
-
-    # Sizing
-    max_open_trades: int = 2
 
     # Filters
     funding_filter: bool = True
@@ -958,7 +957,7 @@ class Bot:
         self._maybe_hourly_report()
 
         # لو في صفقات مفتوحة — نكتفي بتتبع الإغلاق فقط
-        if len(self.paper.open) >= self.cfg.max_open_trades:
+        if len(self.paper.open) >= MAX_OPEN_TRADES:
             return
 
         # هدوء أحداث أو ثروتل
