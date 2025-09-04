@@ -116,6 +116,14 @@ class Config:
     keltner_mult: float = 1.5
     squeeze_bb_mult: float = 1.6
 
+    # SCALP strategy tuning
+    scalp_rsi_buy: float = 40.0
+    scalp_rsi_sell: float = 60.0
+    scalp_tp_atr_mult: float = 1.2
+    scalp_sl_atr_mult: float = 0.8
+    scalp_bb_k: float = 2.0
+    debug_signals: bool = False
+
     # Sizing
     max_open_trades: int = 2
 
@@ -191,8 +199,8 @@ class Notifier:
         self.base = f"https://api.telegram.org/bot{cfg.telegram_token}" if self.enabled else None
         self.chat_id = cfg.telegram_chat_id
     def send(self, text: str):
+        print(text)
         if not self.enabled:
-            print(text)
             return
         try:
             r = requests.post(f"{self.base}/sendMessage",
@@ -430,7 +438,7 @@ def compute_indicators(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
     d["rsi"] = ta.momentum.RSIIndicator(d["close"], window=cfg.rsi_len).rsi()
 
-    bb = ta.volatility.BollingerBands(d["close"], window=cfg.bb_len, window_dev=cfg.bb_std)
+    bb = ta.volatility.BollingerBands(d["close"], window=cfg.bb_len, window_dev=cfg.scalp_bb_k)
     d["bb_mid"], d["bb_up"], d["bb_dn"] = bb.bollinger_mavg(), bb.bollinger_hband(), bb.bollinger_lband()
 
     atr = ta.volatility.AverageTrueRange(d["high"], d["low"], d["close"], window=cfg.atr_window)
@@ -545,19 +553,23 @@ def get_tp_sl(entry: float, side: str, row: pd.Series, cfg: Config) -> Tuple[flo
 def sig_scalp(row: pd.Series, cfg: Config) -> Optional[Signal]:
     a = safe_float(row.get("atr", np.nan))
     if np.isnan(a) or a <= 0:
+        if cfg.debug_signals:
+            print("[DEBUG] SCALP skip: invalid ATR")
         return None
     price = float(row["close"])
     bb_lo = float(row["bb_dn"])
     bb_hi = float(row["bb_up"])
     r = float(row["rsi"])
-    if price <= bb_lo and r <= 40:
-        tp = price + 1.2 * a
-        sl = price - 0.8 * a
+    if price <= bb_lo and r <= cfg.scalp_rsi_buy:
+        tp = price + cfg.scalp_tp_atr_mult * a
+        sl = price - cfg.scalp_sl_atr_mult * a
         return Signal("buy", sl, tp, "SCALP", f"px<=BBlo & RSI={r:.1f}")
-    if price >= bb_hi and r >= 60:
-        tp = price - 1.2 * a
-        sl = price + 0.8 * a
+    if price >= bb_hi and r >= cfg.scalp_rsi_sell:
+        tp = price - cfg.scalp_tp_atr_mult * a
+        sl = price + cfg.scalp_sl_atr_mult * a
         return Signal("sell", sl, tp, "SCALP", f"px>=BBhi & RSI={r:.1f}")
+    if cfg.debug_signals:
+        print(f"[DEBUG] SCALP skip: px={price:.4f} bb_lo={bb_lo:.4f} bb_hi={bb_hi:.4f} rsi={r:.2f}")
     return None
 
 def ctx_key(regime: Regime) -> str:
