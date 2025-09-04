@@ -640,10 +640,14 @@ class Paper:
         else:
             return low <= level if is_tp else high >= level
 
-    def update_with_candle(self, symbol: str, high: float, low: float):
+    def update_with_candle(self, symbol: str, high: float, low: float, ts) -> List[PaperTrade]:
         to_close = []
         for tid, t in list(self.open.items()):
-            if t.status != "open" or t.symbol != symbol: continue
+            if t.status != "open" or t.symbol != symbol:
+                continue
+            # لا نغلق الصفقة باستخدام شمعة أقدم من وقت فتحها
+            if pd.to_datetime(ts) <= pd.to_datetime(t.timestamp):
+                continue
             hit_tp = self._hit(t.side, high, low, t.tp, True)
             hit_sl = self._hit(t.side, high, low, t.sl, False)
             if hit_tp and hit_sl:
@@ -656,11 +660,12 @@ class Paper:
                 continue
             t.status = "closed"; t.result = res; t.exit_price = float(px); t.exit_time = fmt_ts()
             qty = t.qty
-            pnl = (t.exit_price - t.entry) * qty * (1 if t.side=="buy" else -1)
-            t.pnl_usd = round(pnl,4)
+            pnl = (t.exit_price - t.entry) * qty * (1 if t.side == "buy" else -1)
+            t.pnl_usd = round(pnl, 4)
             to_close.append(tid)
         closed = [self.open[k] for k in to_close]
-        for k in to_close: self.open.pop(k, None)
+        for k in to_close:
+            self.open.pop(k, None)
         return closed
 
     def persist_closed(self, closed: List[PaperTrade], cfg: Config, ctx: str):
@@ -906,7 +911,7 @@ class Bot:
                 if len(d) < 2: continue
 
                 last = d.iloc[-1]
-                closed = self.paper.update_with_candle(symbol, float(last["high"]), float(last["low"]))
+                closed = self.paper.update_with_candle(symbol, float(last["high"]), float(last["low"]), last.name)
                 if closed:
                     for t in closed:
                         mkt = self.ex.x.market(t.symbol)
