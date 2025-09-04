@@ -338,7 +338,14 @@ class FuturesExchange:
     def get_balance_usdt(self) -> float:
         try:
             bal = self.x.fetch_balance(params={"type": "swap"})
-            return float(bal["free"].get("USDT", 0.0))
+            free = bal.get("free", {}).get("USDT")
+            if free is None:
+                details = bal.get("info", {}).get("data", [{}])[0].get("details", [])
+                for d in details:
+                    if d.get("ccy") == "USDT":
+                        free = d.get("availBal")
+                        break
+            return float(free or 0.0)
         except Exception:
             return 0.0
 
@@ -989,14 +996,23 @@ class Bot:
                     if (now_utc() - self.last_time[symbol]).total_seconds()/60.0 < self.cfg.min_minutes_between_same_signal:
                         continue
 
-                base_qty = (TRADE_MARGIN_USD * LEVERAGE) / price
+                bal = self.ex.get_balance_usdt()
+                desired_notional = TRADE_MARGIN_USD * LEVERAGE
+                max_notional = bal * LEVERAGE * 0.95  # احتفظ بـ5% كاحتياطي للرسوم
+                notional_ref = min(desired_notional, max_notional)
+                if notional_ref <= 0:
+                    print(f"[WARN] skipping {symbol}: balance {bal:.2f} USDT is too low")
+                    continue
+                if notional_ref < desired_notional:
+                    print(f"[WARN] reducing order size to {notional_ref:.2f} USDT notional due to balance {bal:.2f}")
+
+                base_qty = notional_ref / price
                 mkt = self.ex.x.market(symbol)
                 contract_size = float(mkt.get("contractSize") or 1)
                 contract_qty = base_qty / contract_size
                 contract_qty = float(self.ex.x.amount_to_precision(symbol, contract_qty))
                 base_qty = contract_qty * contract_size
                 notional_ref = base_qty * price
-                bal = self.ex.get_balance_usdt()
                 req_margin = notional_ref / LEVERAGE
                 if bal < req_margin:
                     print(f"[WARN] skipping {symbol}: need {req_margin:.2f} USDT but only {bal:.2f} available")
