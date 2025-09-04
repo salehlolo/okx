@@ -179,6 +179,7 @@ class Config:
     trades_csv: str  = "./logs/trades_log.csv"
     models_csv: str  = "./logs/models_log.csv"
     ml_csv: str      = "./logs/ml_dataset.csv"
+    state_json: str  = "./logs/state.json"
 
 # =========================
 # Telegram
