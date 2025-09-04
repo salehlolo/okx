@@ -66,7 +66,7 @@ def pct(n): return f"{n*100:.2f}%"
 
 @dataclass
 class Config:
-    timeframe: str = "15m"
+    timeframe: str = "30m"
     lookback: int = 800
 
     # Indicators / windows
@@ -1060,7 +1060,7 @@ class Bot:
 
 def parse_args() -> Config:
     p = argparse.ArgumentParser(description="Evolving Committee Scalper (Alerts Only) — No OpenAI")
-    p.add_argument("--timeframe", default="15m")
+    p.add_argument("--timeframe", default="30m")
     p.add_argument("--quiet", nargs="*", default=None, help="UTC HH:MM times to avoid (e.g., 12:30 18:00)")
     p.add_argument("--top", type=int, default=None, help="Top N USDT perpetuals to scan (override config)")
     args = p.parse_args()
