@@ -12,9 +12,9 @@ Env:
   (اختياري) CRYPTOPANIC_TOKEN, NEWSAPI_KEY  ← تقدر تسيبهم فاضيين
 """
 
-import os, time, json, argparse, datetime as dt, random, math
+import os, time, json, argparse, datetime as dt, math
 from dataclasses import dataclass, asdict
-from typing import Optional, Tuple, List, Dict, Callable
+from typing import Optional, Tuple, List, Dict
 
 import numpy as np
 import pandas as pd
@@ -116,6 +116,14 @@ class Config:
     keltner_mult: float = 1.5
     squeeze_bb_mult: float = 1.6
 
+    # SCALP strategy tuning
+    scalp_rsi_buy: float = 40.0
+    scalp_rsi_sell: float = 60.0
+    scalp_tp_atr_mult: float = 1.2
+    scalp_sl_atr_mult: float = 0.8
+    scalp_bb_k: float = 2.0
+    debug_signals: bool = False
+
     # Sizing
     max_open_trades: int = 2
 
@@ -173,10 +181,6 @@ class Config:
     # Committee Override: لازم أقل حاجة X نماذج تتفق على نفس الاتجاه
     committee_min_agree: int = 2
 
-    # Daily Stop Loss: يوقف لباقي اليوم لو نزل -2% من رأس المال المرجعي
-    daily_stop_enabled: bool = True
-    daily_stop_pct: float = 0.02  # 2%
-
     # Files
     logs_dir: str = "./logs"
     signals_csv: str = "./logs/signals_log.csv"
@@ -195,8 +199,8 @@ class Notifier:
         self.base = f"https://api.telegram.org/bot{cfg.telegram_token}" if self.enabled else None
         self.chat_id = cfg.telegram_chat_id
     def send(self, text: str):
+        print(text)
         if not self.enabled:
-            print(text)
             return
         try:
             r = requests.post(f"{self.base}/sendMessage",
@@ -316,6 +320,14 @@ class FuturesExchange:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         return df.dropna()
 
+    def fetch_ticker_price(self, symbol: str) -> Optional[float]:
+        """Fetch the latest trade price for a symbol."""
+        try:
+            ticker = self.x.fetch_ticker(symbol)
+            return safe_float(ticker.get("last")) or safe_float(ticker.get("close"))
+        except Exception:
+            return None
+
     def fetch_funding_rate(self, symbol: str) -> Optional[float]:
         try:
             fr = self.x.fetch_funding_rate(symbol)
@@ -326,7 +338,14 @@ class FuturesExchange:
     def get_balance_usdt(self) -> float:
         try:
             bal = self.x.fetch_balance(params={"type": "swap"})
-            return float(bal["free"].get("USDT", 0.0))
+            free = bal.get("free", {}).get("USDT")
+            if free is None:
+                details = bal.get("info", {}).get("data", [{}])[0].get("details", [])
+                for d in details:
+                    if d.get("ccy") == "USDT":
+                        free = d.get("availBal")
+                        break
+            return float(free or 0.0)
         except Exception:
             return 0.0
 
@@ -434,7 +453,7 @@ def compute_indicators(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
     d["rsi"] = ta.momentum.RSIIndicator(d["close"], window=cfg.rsi_len).rsi()
 
-    bb = ta.volatility.BollingerBands(d["close"], window=cfg.bb_len, window_dev=cfg.bb_std)
+    bb = ta.volatility.BollingerBands(d["close"], window=cfg.bb_len, window_dev=cfg.scalp_bb_k)
     d["bb_mid"], d["bb_up"], d["bb_dn"] = bb.bollinger_mavg(), bb.bollinger_hband(), bb.bollinger_lband()
 
     atr = ta.volatility.AverageTrueRange(d["high"], d["low"], d["close"], window=cfg.atr_window)
@@ -543,232 +562,34 @@ def get_tp_sl(entry: float, side: str, row: pd.Series, cfg: Config) -> Tuple[flo
     else:
         return make_tp_sl(entry, side, cfg)
 
+# SCALP strategy (BB + RSI)
 # =========================
-# Base strategies
-# =========================
 
-def sig_trend(row: pd.Series, cfg: Config) -> Optional[Signal]:
-    # ==== تعديل #3: فلترة حسب حالة السوق (Regime Filtering) ====
-    regime = classify_regime(row, cfg)
-    if regime.trend == "neutral":
+def sig_scalp(row: pd.Series, cfg: Config) -> Optional[Tuple[str, str]]:
+    """Determine SCALP trade direction based on Bollinger and RSI."""
+    a = safe_float(row.get("atr", np.nan))
+    if np.isnan(a) or a <= 0:
+        if cfg.debug_signals:
+            print("[DEBUG] SCALP skip: invalid ATR")
         return None
-        
-    up = (row["ema9"] > row["ema21"]) and (row["close"] > row["ema9"]) and (row["ema9_slope"] > cfg.trend_min_slope)
-    dn = (row["ema9"] < row["ema21"]) and (row["close"] < row["ema9"]) and (row["ema9_slope"] < -cfg.trend_min_slope)
-    
-    if up or dn:
-        side = "buy" if up else "sell"
-        entry = float(row["close"])
-        tp, sl = get_tp_sl(entry, side, row, cfg)
-        if up:
-            conf = clamp(0.55 + (0.2 if row.get("vol_spike", False) else 0.0) + (0.15 if row["ema21_slope"]>0 else 0.0),0,1)
-            return Signal("buy", sl, tp, "TREND", "EMA9>EMA21 + slope + vol", conf)
-        if dn:
-            conf = clamp(0.55 + (0.2 if row.get("vol_spike", False) else 0.0) + (0.15 if row["ema21_slope"]<0 else 0.0),0,1)
-            return Signal("sell", sl, tp, "TREND", "EMA9<EMA21 + slope + vol", conf)
-    return None
-
-def sig_bo(row: pd.Series, cfg: Config) -> Optional[Signal]:
-    # ==== تعديل #3: فلترة حسب حالة السوق (Regime Filtering) ====
-    regime = classify_regime(row, cfg)
-    if regime.trend == "neutral":
-        return None
-        
-    atr = safe_float(row.get("atr", np.nan))
-    if np.isnan(atr) or atr <= 0: return None
-    rng = (row["high"] - row["low"])
-    if not (rng > cfg.bo_range_share * atr): return None
-    
-    above = row["close"] >= row["recent_high"] * 0.999
-    below = row["close"] <= row["recent_low"] * 1.001
-    
-    if above or below:
-        side = "buy" if above else "sell"
-        entry = float(row["close"])
-        tp, sl = get_tp_sl(entry, side, row, cfg)
-        if above:
-            conf = clamp(0.6 + (0.2 if row.get("bo_vol_spike", False) else 0.0) + (0.2 if row["ema9"]>row["ema21"] else 0.0),0,1)
-            return Signal("buy", sl, tp, "BO", "High breakout + range + vol", conf)
-        if below:
-            conf = clamp(0.6 + (0.2 if row.get("bo_vol_spike", False) else 0.0) + (0.2 if row["ema9"]<row["ema21"] else 0.0),0,1)
-            return Signal("sell", sl, tp, "BO", "Low breakout + range + vol", conf)
-    return None
-
-def sig_mr(row: pd.Series, cfg: Config) -> Optional[Signal]:
-    # ==== تعديل #3: فلترة حسب حالة السوق (Regime Filtering) ====
-    regime = classify_regime(row, cfg)
-    if regime.trend != "neutral":
-        return None
-        
-    if np.isnan(row.get("rsi", np.nan)): return None
     price = float(row["close"])
-    
-    is_buy = (row["rsi"] <= cfg.mr_rsi_buy) and (price <= row["bb_dn"])
-    is_sell = (row["rsi"] >= cfg.mr_rsi_sell) and (price >= row["bb_up"])
-    
-    if is_buy or is_sell:
-        side = "buy" if is_buy else "sell"
-        tp, sl = get_tp_sl(price, side, row, cfg)
-        if is_buy:
-            conf = clamp(0.55 + (0.2 if price <= row["sr_low"]*1.003 else 0.0) + (0.1 if row["ema9"]>row["ema21"] else 0.0),0,1)
-            return Signal("buy", sl, tp, "MR", "RSI low + lower band + S/R", conf)
-        if is_sell:
-            conf = clamp(0.55 + (0.2 if price >= row["sr_high"]*0.997 else 0.0) + (0.1 if row["ema9"]<row["ema21"] else 0.0),0,1)
-            return Signal("sell", sl, tp, "MR", "RSI high + upper band + S/R", conf)
+    bb_lo = float(row["bb_dn"])
+    bb_hi = float(row["bb_up"])
+    r = float(row["rsi"])
+    if price <= bb_lo and r <= cfg.scalp_rsi_buy:
+        return ("buy", f"SCALP: px<=BBlo & RSI={r:.1f}")
+    if price >= bb_hi and r >= cfg.scalp_rsi_sell:
+        return ("sell", f"SCALP: px>=BBhi & RSI={r:.1f}")
+    if cfg.debug_signals:
+        print(f"[DEBUG] SCALP skip: px={price:.4f} bb_lo={bb_lo:.4f} bb_hi={bb_hi:.4f} rsi={r:.2f}")
     return None
-
-# =========================
-# New strategies (PB / VWAP-R / KSQ)
-# =========================
-
-def sig_pb(row: pd.Series, cfg: Config) -> Optional[Signal]:
-    # ==== تعديل #3: فلترة حسب حالة السوق (Regime Filtering) ====
-    regime = classify_regime(row, cfg)
-    if regime.trend == "neutral":
-        return None
-
-    wick_up = row["high"] - max(row["close"], row["open"])
-    wick_dn = min(row["close"], row["open"]) - row["low"]
-    wick_ratio_up = wick_up / max((row["high"] - row["low"]), 1e-9)
-    wick_ratio_dn = wick_dn / max((row["high"] - row["low"]), 1e-9)
-
-    if row["ema9"] > row["ema21"]:
-        near = (row["close"] >= row["ema21"]*(1 - cfg.pb_pullback_pct)) and (row["close"] <= row["ema21"]*(1 + cfg.pb_pullback_pct))
-        if near and wick_ratio_dn >= cfg.pb_wick_ratio and row["ema21_slope"] > 0:
-            price = float(row["close"]); tp, sl = get_tp_sl(price,"buy", row, cfg)
-            conf = clamp(0.58 + (0.12 if row.get("vol_spike", False) else 0.0),0,1)
-            return Signal("buy", sl, tp, "PB", "Pullback to EMA21 + bullish wick", conf)
-
-    if row["ema9"] < row["ema21"]:
-        near = (row["close"] >= row["ema21"]*(1 - cfg.pb_pullback_pct)) and (row["close"] <= row["ema21"]*(1 + cfg.pb_pullback_pct))
-        if near and wick_ratio_up >= cfg.pb_wick_ratio and row["ema21_slope"] < 0:
-            price = float(row["close"]); tp, sl = get_tp_sl(price,"sell", row, cfg)
-            conf = clamp(0.58 + (0.12 if row.get("vol_spike", False) else 0.0),0,1)
-            return Signal("sell", sl, tp, "PB", "Pullback to EMA21 + bearish wick", conf)
-    return None
-
-def sig_vwap_r(row: pd.Series, cfg: Config) -> Optional[Signal]:
-    # ==== تعديل #3: فلترة حسب حالة السوق (Regime Filtering) ====
-    regime = classify_regime(row, cfg)
-    if regime.trend != "neutral":
-        return None
-        
-    dev = abs(row["close"] - row["vwap"]) / row["close"]
-    threshold = max(cfg.vwap_dev_mult * (safe_float(row.get("atr_pct"), 0.0) or 0.0), 0.0025)
-    if dev < threshold: return None
-    price = float(row["close"])
-    
-    if row["close"] < row["vwap"] and row["rsi"] <= cfg.mr_rsi_buy:
-        tp, sl = get_tp_sl(price, "buy", row, cfg)
-        return Signal("buy", sl, tp, "VWAP-R", "Deep below VWAP + RSI low", 0.56)
-    if row["close"] > row["vwap"] and row["rsi"] >= cfg.mr_rsi_sell:
-        tp, sl = get_tp_sl(price, "sell", row, cfg)
-        return Signal("sell", sl, tp, "VWAP-R", "Deep above VWAP + RSI high", 0.56)
-    return None
-
-def sig_ksq(row: pd.Series, cfg: Config) -> Optional[Signal]:
-    # ==== تعديل #3: فلترة حسب حالة السوق (Regime Filtering) ====
-    regime = classify_regime(row, cfg)
-    if regime.trend == "neutral":
-        return None
-        
-    squeeze = row.get("bb_width", np.nan) < (safe_float(row.get("atr_pct"),0)*cfg.squeeze_bb_mult)
-    if not squeeze: return None
-    price = float(row["close"])
-    
-    if (price >= row["kel_up"]) and (row["di_pos"] > row["di_neg"]) and (row["ema21_slope"] > 0):
-        tp, sl = get_tp_sl(price, "buy", row, cfg)
-        return Signal("buy", sl, tp, "KSQ", "Squeeze + break above Keltner + DI+", 0.6)
-    if (price <= row["kel_dn"]) and (row["di_neg"] > row["di_pos"]) and (row["ema21_slope"] < 0):
-        tp, sl = get_tp_sl(price, "sell", row, cfg)
-        return Signal("sell", sl, tp, "KSQ", "Squeeze + break below Keltner + DI-", 0.6)
-    return None
-
-# =========================
-# Self-Evolving (محلي)
-# =========================
-
-def mutate_params(cfg: Config) -> Dict[str,float]:
-    g = {}
-    def jitter(val, rel=0.2, lo=None, hi=None):
-        v = val * (1 + random.uniform(-rel, rel))
-        if lo is not None: v = max(v, lo)
-        if hi is not None: v = min(v, hi)
-        return v
-    g["trend_min_slope"] = jitter(cfg.trend_min_slope, 0.5, 0.00005, 0.0015)
-    g["bo_range_share"]  = clamp(jitter(cfg.bo_range_share, 0.3, 0.2, 0.8), 0.2, 0.8)
-    g["mr_rsi_buy"]      = clamp(jitter(cfg.mr_rsi_buy, 0.2), 10, 40)
-    g["mr_rsi_sell"]     = clamp(jitter(cfg.mr_rsi_sell, 0.2), 60, 90)
-    g["pb_pullback_pct"] = clamp(jitter(cfg.pb_pullback_pct, 0.5, 0.001, 0.008), 0.001, 0.01)
-    g["keltner_mult"]    = clamp(jitter(cfg.keltner_mult, 0.3, 1.0, 2.5), 1.0, 3.0)
-    return g
-
-def apply_mutated_signal(row: pd.Series, base_name: str, params: Dict[str,float], cfg: Config) -> Optional[Signal]:
-    c2 = Config(**asdict(cfg))
-    for k,v in params.items():
-        setattr(c2, k, v)
-    if base_name=="TREND": return sig_trend(row, c2)
-    if base_name=="BO":    return sig_bo(row, c2)
-    if base_name=="MR":    return sig_mr(row, c2)
-    if base_name=="PB":    return sig_pb(row, c2)
-    if base_name=="VWAP-R":return sig_vwap_r(row, c2)
-    if base_name=="KSQ":   return sig_ksq(row, c2)
-    return None
-
-# =========================
-# Committee & Bandit memory
-# =========================
 
 def ctx_key(regime: Regime) -> str:
     return f"{regime.trend}|{regime.vol_bucket}"
-
-class WeightedBandit:
-    """Simple weighted bandit storing rewards per strategy"""
-    def __init__(self, path: str):
-        self.path = path
-        try:
-            with open(self.path, "r") as f:
-                self.s = json.load(f)
-        except Exception:
-            self.s = {}
-
-    def _slot(self, key: str) -> Dict[str, float]:
-        return self.s.setdefault(key, {"reward_sum": 0.0, "count": 0})
-
-    def save(self):
-        ensure_dir(self.path)
-        with open(self.path, "w") as f:
-            json.dump(self.s, f)
-
-    def weight(self, key: str) -> float:
-        d = self._slot(key)
-        if d["count"] == 0:
-            return 1.0
-        avg = d["reward_sum"] / d["count"]
-        return max(0.0, 1.0 + avg)
-
-    def update(self, key: str, reward: float):
-        d = self._slot(key)
-        d["reward_sum"] += reward
-        d["count"] += 1
-        self.save()
-
-    def select(self, strategies: List[str]) -> str:
-        if not strategies:
-            raise ValueError("no strategies provided")
-        weights = [self.weight(s) for s in strategies]
-        if sum(weights) <= 0:
-            return random.choice(strategies)
-        return random.choices(strategies, weights=weights, k=1)[0]
-
-    def decay_weights(self, factor: float = 0.995):
-        for d in self.s.values():
-            d["reward_sum"] *= factor
-        self.save()
-
 # =========================
 # Paper Engine
 # =========================
+
 
 @dataclass
 class PaperTrade:
@@ -831,10 +652,14 @@ class Paper:
         else:
             return low <= level if is_tp else high >= level
 
-    def update_with_candle(self, symbol: str, high: float, low: float):
+    def update_with_candle(self, symbol: str, high: float, low: float, ts) -> List[PaperTrade]:
         to_close = []
         for tid, t in list(self.open.items()):
-            if t.status != "open" or t.symbol != symbol: continue
+            if t.status != "open" or t.symbol != symbol:
+                continue
+            # لا نغلق الصفقة باستخدام شمعة أقدم من وقت فتحها
+            if pd.to_datetime(ts) <= pd.to_datetime(t.timestamp):
+                continue
             hit_tp = self._hit(t.side, high, low, t.tp, True)
             hit_sl = self._hit(t.side, high, low, t.sl, False)
             if hit_tp and hit_sl:
@@ -847,11 +672,12 @@ class Paper:
                 continue
             t.status = "closed"; t.result = res; t.exit_price = float(px); t.exit_time = fmt_ts()
             qty = t.qty
-            pnl = (t.exit_price - t.entry) * qty * (1 if t.side=="buy" else -1)
-            t.pnl_usd = round(pnl,4)
+            pnl = (t.exit_price - t.entry) * qty * (1 if t.side == "buy" else -1)
+            t.pnl_usd = round(pnl, 4)
             to_close.append(tid)
         closed = [self.open[k] for k in to_close]
-        for k in to_close: self.open.pop(k, None)
+        for k in to_close:
+            self.open.pop(k, None)
         return closed
 
     def persist_closed(self, closed: List[PaperTrade], cfg: Config, ctx: str):
@@ -1012,58 +838,12 @@ class Bot:
         base_universe = self.ex.get_top_symbols(cfg.top_n_symbols)
         self.symbols: List[str] = self.ex.filter_healthy(base_universe)
         self.news = NewsGuard(cfg)
-        self.state = self._load_state()
-        self.bandit = WeightedBandit(os.path.join(cfg.logs_dir, "bandit_state.json"))
         self.last_key: Dict[str, Optional[str]] = {}
         self.last_time: Dict[str, Optional[dt.datetime]] = {}
         self.last_alert_ts: float = 0.0
         self.closed_trades: List[PaperTrade] = []
         self.last_hourly_report = now_utc()
         self.last_daily_report_date = now_utc().date()
-
-        # ==== إدارة المخاطر الإضافية (state) ====
-        s = self.state.setdefault("risk", {})
-        s.setdefault("daily_date", now_utc().date().isoformat())
-        s.setdefault("daily_pnl", 0.0)           # صافي اليوم
-        s.setdefault("daily_stopped", False)     # تم تفعيل الوقف اليومي؟
-        self._save_state()
-
-    def _load_state(self) -> dict:
-        if os.path.exists(self.cfg.state_json):
-            try:
-                with open(self.cfg.state_json,"r",encoding="utf-8") as f: return json.load(f)
-            except Exception: return {}
-        return {}
-
-    def _save_state(self):
-        ensure_dir(self.cfg.state_json)
-        with open(self.cfg.state_json,"w",encoding="utf-8") as f: json.dump(self.state, f, ensure_ascii=False, indent=2)
-
-    # ===== أدوات إدارة المخاطر الإضافية =====
-
-    def _daily_rollover_if_needed(self):
-        r = self.state.setdefault("risk", {})
-        today = now_utc().date().isoformat()
-        if r.get("daily_date") != today:
-            r["daily_date"] = today
-            r["daily_pnl"] = 0.0
-            r["daily_stopped"] = False
-            self._save_state()
-
-    def _daily_stop_active(self) -> bool:
-        r = self.state.setdefault("risk", {})
-        return bool(r.get("daily_stopped", False))
-
-    def _check_and_apply_daily_stop(self):
-        if not self.cfg.daily_stop_enabled:
-            return
-        r = self.state.setdefault("risk", {})
-        # حد الوقف اليومي بالدولار بناءً على راس المال المرجعي
-        limit = -abs(self.cfg.daily_stop_pct) * self.ref_equity
-        if float(r.get("daily_pnl", 0.0)) <= limit and not r.get("daily_stopped", False):
-            r["daily_stopped"] = True
-            self._save_state()
-            self.notifier.send(f"🛑 Daily Stop Triggered — صافي اليوم {r['daily_pnl']:.2f} USDT ≤ {limit:.2f}. إيقاف باقي اليوم.")
 
     def _maybe_hourly_report(self):
         now = now_utc()
@@ -1114,104 +894,8 @@ class Bot:
     def can_alert_now(self) -> bool:
         return (time.time() - self.last_alert_ts) >= self.cfg.min_seconds_between_alerts_global
 
-    def _all_generators(self) -> List[Tuple[str, Callable]]:
-        return [
-            ("TREND", sig_trend),
-            ("BO", sig_bo),
-            ("MR", sig_mr),
-            ("PB", sig_pb),
-            ("VWAP-R", sig_vwap_r),
-            ("KSQ", sig_ksq),
-        ]
-
-    def _committee(self, symbol: str, row: pd.Series, regime: Regime) -> Optional[Signal]:
-        """
-        تمت إضافة:
-        - Committee Override: لازم حد أدنى من النماذج تتفق على نفس الاتجاه (cfg.committee_min_agree)
-        - Confidence Filter: فلترة بالثقة (cfg.min_confidence_accept)
-        """
-        base = self._all_generators()
-        base_map = dict(base)
-        candidates: List[Signal] = []
-
-        # مرشحين أساسيين
-        for name, fn in base:
-            try:
-                s = fn(row, self.cfg)
-                if s: candidates.append(s)
-            except Exception:
-                continue
-
-        # مرشحين مُتحورين (self-evolve)
-        mutated_meta: List[Tuple[str, Signal, float]] = []
-        if self.cfg.evolve_enabled:
-            for _ in range(self.cfg.evolve_mutations_per_round):
-                base_name = self.bandit.select(list(base_map.keys()))
-                fn = base_map[base_name]
-                params = mutate_params(self.cfg)
-                s = apply_mutated_signal(row, base_name, params, self.cfg)
-                if s:
-                    tag = f"{base_name}-MUT"
-                    mutated_meta.append((tag, s, self.cfg.evolve_trial_weight))
-
-        if not candidates and not mutated_meta:
-            return None
-
-        totals = {"buy":0.0, "sell":0.0}
-        details = []
-        agree_count = {"buy":0, "sell":0}
-
-        # نحسب أوزان/درجات التصويت + نعد المتفقين من الأساسيين فقط للـ Override
-        for s in candidates:
-            w = self.bandit.weight(s.model)
-            sc = w * (0.5 + 0.5*s.confidence)
-            totals[s.side] += sc
-            details.append((s.model, s.side, sc, w, s.confidence))
-            agree_count[s.side] += 1
-
-        # المتحورات: تؤثر على السكور فقط (وليس عدّ الاتفاق الأدنى)
-        for tag, s, trial_w in mutated_meta:
-            w = self.bandit.weight(tag) * trial_w
-            sc = w * (0.5 + 0.5*s.confidence)
-            totals[s.side] += sc
-            details.append((tag, s.side, sc, w, s.confidence))
-
-        side_pick = "buy" if totals["buy"] > totals["sell"] else "sell"
-        same_side = [s for s in candidates if s.side==side_pick] + [s for _,s,_ in mutated_meta if s.side==side_pick]
-        if not same_side:
-            return None
-        best_sig = max(same_side, key=lambda x: x.confidence)
-
-        # Dynamic quorum القديم + تعديل خفيف
-        quorum = self.cfg.dyn_quorum_base
-        if regime.vol_bucket == "high": quorum += self.cfg.quorum_boost_high_vol
-        ctx = ctx_key(regime)
-        ctx_means = []
-        for d in self.bandit.s.keys():
-            if ctx in d:
-                bd = self.bandit.s[d]
-                ctx_means.append(bd["a"]/(bd["a"]+bd["b"]))
-        if ctx_means:
-            hit = sum(ctx_means)/len(ctx_means)
-            if hit >= 0.55: quorum += self.cfg.quorum_boost_good_hit
-            elif hit < 0.45: quorum += self.cfg.quorum_penalty_bad_hit
-        quorum = clamp(quorum, 0.45, 0.65)
-
-        denom = totals["buy"] + totals["sell"] + 1e-9
-        decision_score = totals[side_pick] / denom
-        # لجنة القبول النهائية
-        accept_score = (decision_score >= quorum) or (random.random() < self.cfg.exploration_eps)
-        accept_conf  = (best_sig.confidence >= self.cfg.min_confidence_accept)
-        accept_agree = (agree_count[side_pick] >= self.cfg.committee_min_agree)
-
-        accept = accept_score and accept_conf and accept_agree
-
-        for name, side, sc, w, conf in details:
-            self.paper.log_model_vote(self.cfg, symbol, regime, name,
-                                      sc, accept and (side==side_pick), w, conf,
-                                      notes=f"Q={quorum:.2f}; DS={decision_score:.2f}; Agree[{side}]={agree_count[side]}")
-
-        return best_sig if accept else None
+    def _committee(self, symbol: str, row: pd.Series, regime: Regime) -> Optional[Tuple[str, str]]:
+        return sig_scalp(row, self.cfg)
 
     def run(self):
         self.notifier.send(f"[START] Evolving Scalper | TOP {self.cfg.top_n_symbols} | TF {self.cfg.timeframe} | RefEq={self.ref_equity:.2f} USDT")
@@ -1227,7 +911,6 @@ class Bot:
     def loop_once(self):
         # رولات اليوم
         self._maybe_daily_report()
-        self._daily_rollover_if_needed()
 
         base_universe = self.ex.get_top_symbols(self.cfg.top_n_symbols)
         self.symbols = self.ex.filter_healthy(base_universe)
@@ -1240,7 +923,7 @@ class Bot:
                 if len(d) < 2: continue
 
                 last = d.iloc[-1]
-                closed = self.paper.update_with_candle(symbol, float(last["high"]), float(last["low"]))
+                closed = self.paper.update_with_candle(symbol, float(last["high"]), float(last["low"]), last.name)
                 if closed:
                     for t in closed:
                         mkt = self.ex.x.market(t.symbol)
@@ -1257,8 +940,6 @@ class Bot:
                     pnl_sum = 0.0
                     sl_count = 0
                     for t in closed:
-                        reward = float(t.pnl_usd or 0.0) / self.ref_equity
-                        self.bandit.update(t.model, reward)
                         pnl_sum += float(t.pnl_usd or 0.0)
                         if t.result == "sl": sl_count += 1
                         emoji = "✅" if t.result=="tp" else "❌"
@@ -1271,14 +952,6 @@ class Bot:
                             f"• PnL: {t.pnl_usd:+.2f} USDT | Hold: {hold_s}s",
                         )
                         self.closed_trades.append(t)
-                    # حدث صافي اليوم
-                    r = self.state.setdefault("risk", {})
-                    r["daily_pnl"] = float(r.get("daily_pnl", 0.0)) + pnl_sum
-                    self._save_state()
-                    # وقّف يومي لو تعدى الحد
-                    self._check_and_apply_daily_stop()
-                    self.bandit.decay_weights(0.998)
-                    self._save_state()
             except Exception:
                 continue
 
@@ -1288,35 +961,34 @@ class Bot:
         if len(self.paper.open) >= self.cfg.max_open_trades:
             return
 
-        # لا تدخل صفقات جديدة لو في وقف يومي
-        if self._daily_stop_active():
-            return
-
         # هدوء أحداث أو ثروتل
-        if in_quiet_window(self.cfg): return
         if not self.can_alert_now(): return
 
         # البحث عن إشارة جديدة
         for symbol in self.symbols:
             try:
-                asset = symbol.split("/")[0]
-                if self.cfg.news_enabled and self.news.too_hot(asset):
-                    continue
-                if self.cfg.funding_filter:
-                    fr = self.ex.fetch_funding_rate(symbol)
-                    if fr is not None and abs(fr) > self.cfg.max_abs_funding:
-                        continue
 
                 df = self.ex.fetch_ohlcv(symbol, self.cfg.timeframe, limit=self.cfg.lookback)
                 d  = compute_indicators(df, self.cfg)
                 if len(d) < 3: continue
 
                 row = d.iloc[-2]
-                price = float(row["close"])
                 regime = classify_regime(row, self.cfg)
 
-                sig = self._committee(symbol, row, regime)
-                if not sig: continue
+                # Determine if SCALP conditions are met
+                sig_info = self._committee(symbol, row, regime)
+                if not sig_info:
+                    continue
+
+                side, reason = sig_info
+
+                # Use live ticker price for entry to avoid stale candles
+                price = self.ex.fetch_ticker_price(symbol)
+                if price is None:
+                    continue
+
+                tp, sl = get_tp_sl(price, side, row, self.cfg)
+                sig = Signal(side, sl, tp, "SCALP", reason)
 
                 # مانع تكرار نفس الإشارة
                 key = f"{symbol}:{self.cfg.timeframe}:{sig.model}:{sig.side}"
@@ -1324,14 +996,23 @@ class Bot:
                     if (now_utc() - self.last_time[symbol]).total_seconds()/60.0 < self.cfg.min_minutes_between_same_signal:
                         continue
 
-                base_qty = (TRADE_MARGIN_USD * LEVERAGE) / price
+                bal = self.ex.get_balance_usdt()
+                desired_notional = TRADE_MARGIN_USD * LEVERAGE
+                max_notional = bal * LEVERAGE * 0.95  # احتفظ بـ5% كاحتياطي للرسوم
+                notional_ref = min(desired_notional, max_notional)
+                if notional_ref <= 0:
+                    print(f"[WARN] skipping {symbol}: balance {bal:.2f} USDT is too low")
+                    continue
+                if notional_ref < desired_notional:
+                    print(f"[WARN] reducing order size to {notional_ref:.2f} USDT notional due to balance {bal:.2f}")
+
+                base_qty = notional_ref / price
                 mkt = self.ex.x.market(symbol)
                 contract_size = float(mkt.get("contractSize") or 1)
                 contract_qty = base_qty / contract_size
                 contract_qty = float(self.ex.x.amount_to_precision(symbol, contract_qty))
                 base_qty = contract_qty * contract_size
                 notional_ref = base_qty * price
-                bal = self.ex.get_balance_usdt()
                 req_margin = notional_ref / LEVERAGE
                 if bal < req_margin:
                     print(f"[WARN] skipping {symbol}: need {req_margin:.2f} USDT but only {bal:.2f} available")
@@ -1342,7 +1023,7 @@ class Bot:
                 order = self.ex.create_demo_order(symbol, sig.side, contract_qty)
                 status_line = "🚀 Executed on OKX Demo" if order else "⚠️ Execution failed on OKX Demo"
                 msg = (
-                    f"📢 [EVOLVE-COMMITTEE - {sig.model}] New Signal\n\n"
+                    f"📢 [SCALP] New Signal\n\n"
                     f"📍 Pair: {symbol}\n"
                     f"🕒 TF: {self.cfg.timeframe} | Ctx: trend={regime.trend}, vol={regime.vol_bucket}\n"
                     f"📈 Side: {sig.side.upper()} | Conf: {sig.confidence:.2f}\n\n"
@@ -1358,12 +1039,16 @@ class Bot:
                 self.last_alert_ts = time.time()
 
                 self.paper.log_signal(symbol, row, sig, base_qty, notional_ref, rr, self.cfg, regime)
+                if not order:
+                    self.last_key[symbol] = key
+                    self.last_time[symbol] = now_utc()
+                    continue
+
                 t = self.paper.open_virtual(symbol, price, sig, base_qty, self.cfg)
                 self.paper.ml_snapshot(t.id, symbol, row, regime)
 
                 self.last_key[symbol] = key
                 self.last_time[symbol] = now_utc()
-                self._save_state()
                 break
 
             except Exception:
@@ -1378,20 +1063,14 @@ def parse_args() -> Config:
     p.add_argument("--timeframe", default="15m")
     p.add_argument("--quiet", nargs="*", default=None, help="UTC HH:MM times to avoid (e.g., 12:30 18:00)")
     p.add_argument("--top", type=int, default=None, help="Top N USDT perpetuals to scan (override config)")
-    p.add_argument("--minconf", type=float, default=None, help="Min confidence to accept (override config)")
-    p.add_argument("--agree", type=int, default=None, help="Min base models agreeing (override config)")
-    p.add_argument("--dailystop", type=float, default=None, help="Daily stop pct (e.g., 0.02 for 2%)")
     args = p.parse_args()
     cfg = Config()
     cfg.timeframe = args.timeframe
     # اسمح بتجاوز الإعدادات من سطر الأوامر
     if args.top is not None: cfg.top_n_symbols = int(args.top)
     if args.quiet is not None: cfg.quiet_windows_utc = tuple(args.quiet)
-    if args.minconf is not None: cfg.min_confidence_accept = float(args.minconf)
-    if args.agree is not None: cfg.committee_min_agree = int(args.agree)
-    if args.dailystop is not None: cfg.daily_stop_pct = float(args.dailystop)
     ensure_dir(cfg.logs_dir)
-    ensure_dir(cfg.signals_csv); ensure_dir(cfg.trades_csv); ensure_dir(cfg.ml_csv); ensure_dir(cfg.models_csv); ensure_dir(cfg.state_json)
+    ensure_dir(cfg.signals_csv); ensure_dir(cfg.trades_csv); ensure_dir(cfg.ml_csv); ensure_dir(cfg.models_csv)
     return cfg
 
 def main():
