@@ -1039,6 +1039,11 @@ class Bot:
                 self.last_alert_ts = time.time()
 
                 self.paper.log_signal(symbol, row, sig, base_qty, notional_ref, rr, self.cfg, regime)
+                if not order:
+                    self.last_key[symbol] = key
+                    self.last_time[symbol] = now_utc()
+                    continue
+
                 t = self.paper.open_virtual(symbol, price, sig, base_qty, self.cfg)
                 self.paper.ml_snapshot(t.id, symbol, row, regime)
 
