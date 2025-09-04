@@ -320,6 +320,14 @@ class FuturesExchange:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         return df.dropna()
 
+    def fetch_ticker_price(self, symbol: str) -> Optional[float]:
+        """Fetch the latest trade price for a symbol."""
+        try:
+            ticker = self.x.fetch_ticker(symbol)
+            return safe_float(ticker.get("last")) or safe_float(ticker.get("close"))
+        except Exception:
+            return None
+
     def fetch_funding_rate(self, symbol: str) -> Optional[float]:
         try:
             fr = self.x.fetch_funding_rate(symbol)
@@ -550,7 +558,8 @@ def get_tp_sl(entry: float, side: str, row: pd.Series, cfg: Config) -> Tuple[flo
 # SCALP strategy (BB + RSI)
 # =========================
 
-def sig_scalp(row: pd.Series, cfg: Config) -> Optional[Signal]:
+def sig_scalp(row: pd.Series, cfg: Config) -> Optional[Tuple[str, str]]:
+    """Determine SCALP trade direction based on Bollinger and RSI."""
     a = safe_float(row.get("atr", np.nan))
     if np.isnan(a) or a <= 0:
         if cfg.debug_signals:
@@ -561,13 +570,9 @@ def sig_scalp(row: pd.Series, cfg: Config) -> Optional[Signal]:
     bb_hi = float(row["bb_up"])
     r = float(row["rsi"])
     if price <= bb_lo and r <= cfg.scalp_rsi_buy:
-        tp = price + cfg.scalp_tp_atr_mult * a
-        sl = price - cfg.scalp_sl_atr_mult * a
-        return Signal("buy", sl, tp, "SCALP", f"px<=BBlo & RSI={r:.1f}")
+        return ("buy", f"SCALP: px<=BBlo & RSI={r:.1f}")
     if price >= bb_hi and r >= cfg.scalp_rsi_sell:
-        tp = price - cfg.scalp_tp_atr_mult * a
-        sl = price + cfg.scalp_sl_atr_mult * a
-        return Signal("sell", sl, tp, "SCALP", f"px>=BBhi & RSI={r:.1f}")
+        return ("sell", f"SCALP: px>=BBhi & RSI={r:.1f}")
     if cfg.debug_signals:
         print(f"[DEBUG] SCALP skip: px={price:.4f} bb_lo={bb_lo:.4f} bb_hi={bb_hi:.4f} rsi={r:.2f}")
     return None
@@ -882,7 +887,7 @@ class Bot:
     def can_alert_now(self) -> bool:
         return (time.time() - self.last_alert_ts) >= self.cfg.min_seconds_between_alerts_global
 
-    def _committee(self, symbol: str, row: pd.Series, regime: Regime) -> Optional[Signal]:
+    def _committee(self, symbol: str, row: pd.Series, regime: Regime) -> Optional[Tuple[str, str]]:
         return sig_scalp(row, self.cfg)
 
     def run(self):
@@ -961,11 +966,22 @@ class Bot:
                 if len(d) < 3: continue
 
                 row = d.iloc[-2]
-                price = float(row["close"])
                 regime = classify_regime(row, self.cfg)
 
-                sig = self._committee(symbol, row, regime)
-                if not sig: continue
+                # Determine if SCALP conditions are met
+                sig_info = self._committee(symbol, row, regime)
+                if not sig_info:
+                    continue
+
+                side, reason = sig_info
+
+                # Use live ticker price for entry to avoid stale candles
+                price = self.ex.fetch_ticker_price(symbol)
+                if price is None:
+                    continue
+
+                tp, sl = get_tp_sl(price, side, row, self.cfg)
+                sig = Signal(side, sl, tp, "SCALP", reason)
 
                 # مانع تكرار نفس الإشارة
                 key = f"{symbol}:{self.cfg.timeframe}:{sig.model}:{sig.side}"
