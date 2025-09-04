@@ -173,17 +173,12 @@ class Config:
     # Committee Override: لازم أقل حاجة X نماذج تتفق على نفس الاتجاه
     committee_min_agree: int = 2
 
-    # Daily Stop Loss: يوقف لباقي اليوم لو نزل -2% من رأس المال المرجعي
-    daily_stop_enabled: bool = True
-    daily_stop_pct: float = 0.02  # 2%
-
     # Files
     logs_dir: str = "./logs"
     signals_csv: str = "./logs/signals_log.csv"
     trades_csv: str  = "./logs/trades_log.csv"
     models_csv: str  = "./logs/models_log.csv"
     ml_csv: str      = "./logs/ml_dataset.csv"
-    state_json: str  = "./logs/state.json"
 
 # =========================
 # Telegram
@@ -813,57 +808,12 @@ class Bot:
         base_universe = self.ex.get_top_symbols(cfg.top_n_symbols)
         self.symbols: List[str] = self.ex.filter_healthy(base_universe)
         self.news = NewsGuard(cfg)
-        self.state = self._load_state()
         self.last_key: Dict[str, Optional[str]] = {}
         self.last_time: Dict[str, Optional[dt.datetime]] = {}
         self.last_alert_ts: float = 0.0
         self.closed_trades: List[PaperTrade] = []
         self.last_hourly_report = now_utc()
         self.last_daily_report_date = now_utc().date()
-
-        # ==== إدارة المخاطر الإضافية (state) ====
-        s = self.state.setdefault("risk", {})
-        s.setdefault("daily_date", now_utc().date().isoformat())
-        s.setdefault("daily_pnl", 0.0)           # صافي اليوم
-        s.setdefault("daily_stopped", False)     # تم تفعيل الوقف اليومي؟
-        self._save_state()
-
-    def _load_state(self) -> dict:
-        if os.path.exists(self.cfg.state_json):
-            try:
-                with open(self.cfg.state_json,"r",encoding="utf-8") as f: return json.load(f)
-            except Exception: return {}
-        return {}
-
-    def _save_state(self):
-        ensure_dir(self.cfg.state_json)
-        with open(self.cfg.state_json,"w",encoding="utf-8") as f: json.dump(self.state, f, ensure_ascii=False, indent=2)
-
-    # ===== أدوات إدارة المخاطر الإضافية =====
-
-    def _daily_rollover_if_needed(self):
-        r = self.state.setdefault("risk", {})
-        today = now_utc().date().isoformat()
-        if r.get("daily_date") != today:
-            r["daily_date"] = today
-            r["daily_pnl"] = 0.0
-            r["daily_stopped"] = False
-            self._save_state()
-
-    def _daily_stop_active(self) -> bool:
-        r = self.state.setdefault("risk", {})
-        return bool(r.get("daily_stopped", False))
-
-    def _check_and_apply_daily_stop(self):
-        if not self.cfg.daily_stop_enabled:
-            return
-        r = self.state.setdefault("risk", {})
-        # حد الوقف اليومي بالدولار بناءً على راس المال المرجعي
-        limit = -abs(self.cfg.daily_stop_pct) * self.ref_equity
-        if float(r.get("daily_pnl", 0.0)) <= limit and not r.get("daily_stopped", False):
-            r["daily_stopped"] = True
-            self._save_state()
-            self.notifier.send(f"🛑 Daily Stop Triggered — صافي اليوم {r['daily_pnl']:.2f} USDT ≤ {limit:.2f}. إيقاف باقي اليوم.")
 
     def _maybe_hourly_report(self):
         now = now_utc()
@@ -931,7 +881,6 @@ class Bot:
     def loop_once(self):
         # رولات اليوم
         self._maybe_daily_report()
-        self._daily_rollover_if_needed()
 
         base_universe = self.ex.get_top_symbols(self.cfg.top_n_symbols)
         self.symbols = self.ex.filter_healthy(base_universe)
@@ -973,13 +922,6 @@ class Bot:
                             f"• PnL: {t.pnl_usd:+.2f} USDT | Hold: {hold_s}s",
                         )
                         self.closed_trades.append(t)
-                    # حدث صافي اليوم
-                    r = self.state.setdefault("risk", {})
-                    r["daily_pnl"] = float(r.get("daily_pnl", 0.0)) + pnl_sum
-                    self._save_state()
-                    # وقّف يومي لو تعدى الحد
-                    self._check_and_apply_daily_stop()
-                    self._save_state()
             except Exception:
                 continue
 
@@ -987,10 +929,6 @@ class Bot:
 
         # لو في صفقات مفتوحة — نكتفي بتتبع الإغلاق فقط
         if len(self.paper.open) >= self.cfg.max_open_trades:
-            return
-
-        # لا تدخل صفقات جديدة لو في وقف يومي
-        if self._daily_stop_active():
             return
 
         # هدوء أحداث أو ثروتل
@@ -1056,7 +994,6 @@ class Bot:
 
                 self.last_key[symbol] = key
                 self.last_time[symbol] = now_utc()
-                self._save_state()
                 break
 
             except Exception:
@@ -1071,16 +1008,14 @@ def parse_args() -> Config:
     p.add_argument("--timeframe", default="15m")
     p.add_argument("--quiet", nargs="*", default=None, help="UTC HH:MM times to avoid (e.g., 12:30 18:00)")
     p.add_argument("--top", type=int, default=None, help="Top N USDT perpetuals to scan (override config)")
-    p.add_argument("--dailystop", type=float, default=None, help="Daily stop pct (e.g., 0.02 for 2%)")
     args = p.parse_args()
     cfg = Config()
     cfg.timeframe = args.timeframe
     # اسمح بتجاوز الإعدادات من سطر الأوامر
     if args.top is not None: cfg.top_n_symbols = int(args.top)
     if args.quiet is not None: cfg.quiet_windows_utc = tuple(args.quiet)
-    if args.dailystop is not None: cfg.daily_stop_pct = float(args.dailystop)
     ensure_dir(cfg.logs_dir)
-    ensure_dir(cfg.signals_csv); ensure_dir(cfg.trades_csv); ensure_dir(cfg.ml_csv); ensure_dir(cfg.models_csv); ensure_dir(cfg.state_json)
+    ensure_dir(cfg.signals_csv); ensure_dir(cfg.trades_csv); ensure_dir(cfg.ml_csv); ensure_dir(cfg.models_csv)
     return cfg
 
 def main():
