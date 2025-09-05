@@ -33,8 +33,9 @@ import requests
 # Constants
 # =========================
 
-# Each trade uses the full account balance at 10× leverage
+# Each trade uses 90% of the account balance at 10× leverage
 LEVERAGE = 10
+BALANCE_FRACTION = 0.9
 
 # =========================
 # Helpers
@@ -1000,7 +1001,7 @@ class Bot:
                         continue
 
                 bal = self.ex.get_balance_usdt()
-                notional_ref = bal * LEVERAGE
+                notional_ref = bal * BALANCE_FRACTION * LEVERAGE
                 if notional_ref <= 0:
                     print(f"[WARN] skipping {symbol}: balance {bal:.2f} USDT is too low")
                     continue
