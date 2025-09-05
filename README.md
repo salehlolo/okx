@@ -33,8 +33,7 @@ import requests
 # Constants
 # =========================
 
-# Each trade uses 50 USDT of margin at 10× leverage (~500 USDT notional)
-TRADE_MARGIN_USD = 50.0
+# Each trade uses the full account balance at 10× leverage
 LEVERAGE = 10
 
 # =========================
@@ -125,7 +124,7 @@ class Config:
     debug_signals: bool = False
 
     # Sizing
-    max_open_trades: int = 2
+    max_open_trades: int = 1
 
     # Filters
     funding_filter: bool = True
@@ -1001,14 +1000,10 @@ class Bot:
                         continue
 
                 bal = self.ex.get_balance_usdt()
-                desired_notional = TRADE_MARGIN_USD * LEVERAGE
-                max_notional = bal * LEVERAGE * 0.95  # احتفظ بـ5% كاحتياطي للرسوم
-                notional_ref = min(desired_notional, max_notional)
+                notional_ref = bal * LEVERAGE
                 if notional_ref <= 0:
                     print(f"[WARN] skipping {symbol}: balance {bal:.2f} USDT is too low")
                     continue
-                if notional_ref < desired_notional:
-                    print(f"[WARN] reducing order size to {notional_ref:.2f} USDT notional due to balance {bal:.2f}")
 
                 base_qty = notional_ref / price
                 mkt = self.ex.x.market(symbol)
