@@ -33,9 +33,9 @@ import requests
 # Constants
 # =========================
 
-# Each trade uses 50 USDT of margin at 10× leverage (~500 USDT notional)
-TRADE_MARGIN_USD = 50.0
+# Each trade uses 90% of the account balance at 10× leverage
 LEVERAGE = 10
+BALANCE_FRACTION = 0.9
 
 # =========================
 # Helpers
@@ -66,7 +66,7 @@ def pct(n): return f"{n*100:.2f}%"
 
 @dataclass
 class Config:
-    timeframe: str = "15m"
+    timeframe: str = "30m"
     lookback: int = 800
 
     # Indicators / windows
@@ -125,7 +125,7 @@ class Config:
     debug_signals: bool = False
 
     # Sizing
-    max_open_trades: int = 2
+    max_open_trades: int = 1
 
     # Filters
     funding_filter: bool = True
@@ -134,6 +134,7 @@ class Config:
     # Account modes (override if auto-detect fails)
     okx_pos_mode: Optional[str] = None   # "net_mode" or "long_short_mode"
     okx_margin_mode: Optional[str] = None  # "cross" or "isolated"
+    okx_demo: bool = True  # استخدم حساب الـ Demo بدلاً من الحقيقي
 
 
     # Quiet windows (UTC HH:MM)
@@ -171,8 +172,8 @@ class Config:
     # Self-Evolving (محلي — مش بيعتمد على OpenAI)
     evolve_enabled: bool = True
     evolve_mutations_per_round: int = 2
-    evolve_trial_weight: float = 0.25
-    evolve_decay: float = 0.98
+    evolve_trial_weight: float = 0.05
+    evolve_decay: float = 0.95
 
     # ==== الإضافات الجديدة (إدارة المخاطر المتقدمة) ====
     # Confidence Filter
@@ -220,33 +221,36 @@ class FuturesExchange:
         key = os.getenv("OKX_API_KEY")
         secret = os.getenv("OKX_API_SECRET")
         password = os.getenv("OKX_API_PASSWORD") or os.getenv("OKX_API_PASSPHRASE")
+        opts = {"defaultType": "swap"}
+        headers = {}
+        if cfg.okx_demo:
+            opts["demo"] = True
+            headers["x-simulated-trading"] = "1"
         self.x = ccxt.okx({
             "apiKey": key,
             "secret": secret,
             "password": password,
-            # Use swap markets in OKX demo environment
-            "options": {
-                "defaultType": "swap",
-                "demo": True,
-            },
-            "headers": {"x-simulated-trading": "1"},
+            "options": opts,
+            "headers": headers,
             "enableRateLimit": True,
             "timeout": 15000,
         })
-        # Force all requests to hit the demo environment
-        try:
-            self.x.set_sandbox_mode(True)
-        except Exception:
-            pass
-        # Demo accounts cannot access the private currencies endpoint; disable it (نغلق من الجهتين)
-        try:
-            self.x.options["fetchCurrencies"] = False
-        except Exception:
-            pass
-        try:
-            self.x.has["fetchCurrencies"] = False
-        except Exception:
-            pass
+        if cfg.okx_demo:
+            # Force all requests to hit the demo environment
+            try:
+                self.x.set_sandbox_mode(True)
+            except Exception:
+                pass
+        if cfg.okx_demo:
+            # Demo accounts cannot access the private currencies endpoint; disable it (نغلق من الجهتين)
+            try:
+                self.x.options["fetchCurrencies"] = False
+            except Exception:
+                pass
+            try:
+                self.x.has["fetchCurrencies"] = False
+            except Exception:
+                pass
         self.x.load_markets()
 
         # Determine account modes for proper order parameters
@@ -349,7 +353,7 @@ class FuturesExchange:
         except Exception:
             return 0.0
 
-    def create_demo_order(self, symbol: str, side: str, contract_amt: float, reduce_only: bool = False):
+    def create_order(self, symbol: str, side: str, contract_amt: float, reduce_only: bool = False):
         """Execute a market order in contract units on OKX."""
         params = {"tdMode": self.margin_mode, "reduceOnly": reduce_only}
         if not self.pos_mode.startswith("net"):
@@ -367,10 +371,10 @@ class FuturesExchange:
             print("[WARN] create_order failed:", e)
             return None
 
-    def close_demo_position(self, symbol: str, orig_side: str, contract_amt: float):
+    def close_position(self, symbol: str, orig_side: str, contract_amt: float):
         """Close an open position by sending the opposite order in contract units."""
         opp = "sell" if orig_side.lower() == "buy" else "buy"
-        return self.create_demo_order(symbol, opp, contract_amt, reduce_only=True)
+        return self.create_order(symbol, opp, contract_amt, reduce_only=True)
 
     def flatten_all(self):
         try:
@@ -388,7 +392,7 @@ class FuturesExchange:
                     sym = p.get("symbol") or p.get("info", {}).get("instId")
                     side = p.get("side") or ("long" if float(p.get("contracts", 0)) > 0 else "short")
                     orig = "buy" if side == "long" else "sell"
-                    self.close_demo_position(sym, orig, amt)
+                    self.close_position(sym, orig, amt)
             except Exception:
                 pass
         except Exception as e:
@@ -842,6 +846,8 @@ class Bot:
         self.last_time: Dict[str, Optional[dt.datetime]] = {}
         self.last_alert_ts: float = 0.0
         self.closed_trades: List[PaperTrade] = []
+        self.model_state: Dict[str, dict] = {}
+        self.load_model_state()
         self.last_hourly_report = now_utc()
         self.last_daily_report_date = now_utc().date()
 
@@ -889,6 +895,64 @@ class Bot:
             self._send_daily_report(self.last_daily_report_date)
             self.last_daily_report_date = today
 
+    def load_model_state(self) -> None:
+        """Load model-performance weights from ``state.json``.
+
+        If the file does not exist or parsing fails, ``self.model_state`` is set
+        to an empty dictionary and a warning is printed.  This method is
+        typically called once at startup.
+        """
+        try:
+            if os.path.exists(self.cfg.state_json):
+                with open(self.cfg.state_json, "r") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        self.model_state = data
+                        return
+        except Exception:
+            print("[WARN] failed to load model_state; starting fresh")
+        self.model_state = {}
+
+    def save_model_state(self) -> None:
+        """Persist the current :attr:`model_state` dictionary to disk."""
+        try:
+            ensure_dir(self.cfg.state_json)
+            with open(self.cfg.state_json, "w") as f:
+                json.dump(self.model_state, f)
+        except Exception as e:
+            print("[WARN] failed to save model_state:", e)
+
+    def update_model_performance(self, model_name: str, pnl: float, entry: float, sl: float) -> None:
+        """Update bandit weights after a trade closes.
+
+        Parameters
+        ----------
+        model_name: str
+            Identifier of the strategy/model.
+        pnl: float
+            Realized profit or loss in absolute terms.
+        entry: float
+            Trade entry price.
+        sl: float
+            Stop-loss price used to compute risk.
+
+        Example
+        -------
+        >>> trade = ...  # some closed trade object
+        >>> bot.update_model_performance(trade.model, trade.pnl_usd, trade.entry, trade.sl)
+        """
+        risk = abs(entry - sl)
+        if risk <= 0:
+            return
+        R = pnl / risk
+        st = self.model_state.setdefault(model_name, {"w": 1.0, "r_avg": 0.0, "n": 0})
+        st["n"] += 1
+        st["r_avg"] = 0.9 * st["r_avg"] + 0.1 * R
+        decay = getattr(self.cfg, "evolve_decay", 0.95)
+        trial_w = getattr(self.cfg, "evolve_trial_weight", 0.05)
+        st["w"] = max(0.1, st["w"] * decay + trial_w * R)
+        self.save_model_state()
+
     # ==========================================
 
     def can_alert_now(self) -> bool:
@@ -930,7 +994,7 @@ class Bot:
                         contract_size = float(mkt.get("contractSize") or 1)
                         contract_qty = t.qty / contract_size
                         contract_qty = float(self.ex.x.amount_to_precision(t.symbol, contract_qty))
-                        self.ex.close_demo_position(t.symbol, t.side, contract_qty)
+                        self.ex.close_position(t.symbol, t.side, contract_qty)
                     reg_row = d.iloc[-2] if len(d)>1 else last
                     regime = classify_regime(reg_row, self.cfg)
                     ctx = ctx_key(regime)
@@ -951,6 +1015,7 @@ class Bot:
                             f"• Entry: {t.entry:.4f} → Exit: {t.exit_price:.4f}\n"
                             f"• PnL: {t.pnl_usd:+.2f} USDT | Hold: {hold_s}s",
                         )
+                        self.update_model_performance(t.model, float(t.pnl_usd or 0.0), t.entry, t.sl)
                         self.closed_trades.append(t)
             except Exception:
                 continue
@@ -997,14 +1062,10 @@ class Bot:
                         continue
 
                 bal = self.ex.get_balance_usdt()
-                desired_notional = TRADE_MARGIN_USD * LEVERAGE
-                max_notional = bal * LEVERAGE * 0.95  # احتفظ بـ5% كاحتياطي للرسوم
-                notional_ref = min(desired_notional, max_notional)
+                notional_ref = bal * BALANCE_FRACTION * LEVERAGE
                 if notional_ref <= 0:
                     print(f"[WARN] skipping {symbol}: balance {bal:.2f} USDT is too low")
                     continue
-                if notional_ref < desired_notional:
-                    print(f"[WARN] reducing order size to {notional_ref:.2f} USDT notional due to balance {bal:.2f}")
 
                 base_qty = notional_ref / price
                 mkt = self.ex.x.market(symbol)
@@ -1020,8 +1081,9 @@ class Bot:
                 risk = abs(price - sig.sl); reward = abs(sig.tp - price)
                 rr = round(reward / risk, 2) if risk > 0 else None
 
-                order = self.ex.create_demo_order(symbol, sig.side, contract_qty)
-                status_line = "🚀 Executed on OKX Demo" if order else "⚠️ Execution failed on OKX Demo"
+                order = self.ex.create_order(symbol, sig.side, contract_qty)
+                env = "OKX Demo" if self.cfg.okx_demo else "OKX Live"
+                status_line = f"🚀 Executed on {env}" if order else f"⚠️ Execution failed on {env}"
                 msg = (
                     f"📢 [SCALP] New Signal\n\n"
                     f"📍 Pair: {symbol}\n"
@@ -1060,12 +1122,14 @@ class Bot:
 
 def parse_args() -> Config:
     p = argparse.ArgumentParser(description="Evolving Committee Scalper (Alerts Only) — No OpenAI")
-    p.add_argument("--timeframe", default="15m")
+    p.add_argument("--timeframe", default="30m")
     p.add_argument("--quiet", nargs="*", default=None, help="UTC HH:MM times to avoid (e.g., 12:30 18:00)")
     p.add_argument("--top", type=int, default=None, help="Top N USDT perpetuals to scan (override config)")
+    p.add_argument("--live", action="store_true", help="Use real trading environment instead of OKX demo")
     args = p.parse_args()
     cfg = Config()
     cfg.timeframe = args.timeframe
+    cfg.okx_demo = not args.live
     # اسمح بتجاوز الإعدادات من سطر الأوامر
     if args.top is not None: cfg.top_n_symbols = int(args.top)
     if args.quiet is not None: cfg.quiet_windows_utc = tuple(args.quiet)
