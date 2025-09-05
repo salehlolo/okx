@@ -134,6 +134,7 @@ class Config:
     # Account modes (override if auto-detect fails)
     okx_pos_mode: Optional[str] = None   # "net_mode" or "long_short_mode"
     okx_margin_mode: Optional[str] = None  # "cross" or "isolated"
+    okx_demo: bool = True  # استخدم حساب الـ Demo بدلاً من الحقيقي
 
 
     # Quiet windows (UTC HH:MM)
@@ -220,33 +221,36 @@ class FuturesExchange:
         key = os.getenv("OKX_API_KEY")
         secret = os.getenv("OKX_API_SECRET")
         password = os.getenv("OKX_API_PASSWORD") or os.getenv("OKX_API_PASSPHRASE")
+        opts = {"defaultType": "swap"}
+        headers = {}
+        if cfg.okx_demo:
+            opts["demo"] = True
+            headers["x-simulated-trading"] = "1"
         self.x = ccxt.okx({
             "apiKey": key,
             "secret": secret,
             "password": password,
-            # Use swap markets in OKX demo environment
-            "options": {
-                "defaultType": "swap",
-                "demo": True,
-            },
-            "headers": {"x-simulated-trading": "1"},
+            "options": opts,
+            "headers": headers,
             "enableRateLimit": True,
             "timeout": 15000,
         })
-        # Force all requests to hit the demo environment
-        try:
-            self.x.set_sandbox_mode(True)
-        except Exception:
-            pass
-        # Demo accounts cannot access the private currencies endpoint; disable it (نغلق من الجهتين)
-        try:
-            self.x.options["fetchCurrencies"] = False
-        except Exception:
-            pass
-        try:
-            self.x.has["fetchCurrencies"] = False
-        except Exception:
-            pass
+        if cfg.okx_demo:
+            # Force all requests to hit the demo environment
+            try:
+                self.x.set_sandbox_mode(True)
+            except Exception:
+                pass
+        if cfg.okx_demo:
+            # Demo accounts cannot access the private currencies endpoint; disable it (نغلق من الجهتين)
+            try:
+                self.x.options["fetchCurrencies"] = False
+            except Exception:
+                pass
+            try:
+                self.x.has["fetchCurrencies"] = False
+            except Exception:
+                pass
         self.x.load_markets()
 
         # Determine account modes for proper order parameters
@@ -349,7 +353,7 @@ class FuturesExchange:
         except Exception:
             return 0.0
 
-    def create_demo_order(self, symbol: str, side: str, contract_amt: float, reduce_only: bool = False):
+    def create_order(self, symbol: str, side: str, contract_amt: float, reduce_only: bool = False):
         """Execute a market order in contract units on OKX."""
         params = {"tdMode": self.margin_mode, "reduceOnly": reduce_only}
         if not self.pos_mode.startswith("net"):
@@ -367,10 +371,10 @@ class FuturesExchange:
             print("[WARN] create_order failed:", e)
             return None
 
-    def close_demo_position(self, symbol: str, orig_side: str, contract_amt: float):
+    def close_position(self, symbol: str, orig_side: str, contract_amt: float):
         """Close an open position by sending the opposite order in contract units."""
         opp = "sell" if orig_side.lower() == "buy" else "buy"
-        return self.create_demo_order(symbol, opp, contract_amt, reduce_only=True)
+        return self.create_order(symbol, opp, contract_amt, reduce_only=True)
 
     def flatten_all(self):
         try:
@@ -388,7 +392,7 @@ class FuturesExchange:
                     sym = p.get("symbol") or p.get("info", {}).get("instId")
                     side = p.get("side") or ("long" if float(p.get("contracts", 0)) > 0 else "short")
                     orig = "buy" if side == "long" else "sell"
-                    self.close_demo_position(sym, orig, amt)
+                    self.close_position(sym, orig, amt)
             except Exception:
                 pass
         except Exception as e:
@@ -930,7 +934,7 @@ class Bot:
                         contract_size = float(mkt.get("contractSize") or 1)
                         contract_qty = t.qty / contract_size
                         contract_qty = float(self.ex.x.amount_to_precision(t.symbol, contract_qty))
-                        self.ex.close_demo_position(t.symbol, t.side, contract_qty)
+                        self.ex.close_position(t.symbol, t.side, contract_qty)
                     reg_row = d.iloc[-2] if len(d)>1 else last
                     regime = classify_regime(reg_row, self.cfg)
                     ctx = ctx_key(regime)
@@ -1020,8 +1024,9 @@ class Bot:
                 risk = abs(price - sig.sl); reward = abs(sig.tp - price)
                 rr = round(reward / risk, 2) if risk > 0 else None
 
-                order = self.ex.create_demo_order(symbol, sig.side, contract_qty)
-                status_line = "🚀 Executed on OKX Demo" if order else "⚠️ Execution failed on OKX Demo"
+                order = self.ex.create_order(symbol, sig.side, contract_qty)
+                env = "OKX Demo" if self.cfg.okx_demo else "OKX Live"
+                status_line = f"🚀 Executed on {env}" if order else f"⚠️ Execution failed on {env}"
                 msg = (
                     f"📢 [SCALP] New Signal\n\n"
                     f"📍 Pair: {symbol}\n"
@@ -1063,9 +1068,11 @@ def parse_args() -> Config:
     p.add_argument("--timeframe", default="30m")
     p.add_argument("--quiet", nargs="*", default=None, help="UTC HH:MM times to avoid (e.g., 12:30 18:00)")
     p.add_argument("--top", type=int, default=None, help="Top N USDT perpetuals to scan (override config)")
+    p.add_argument("--live", action="store_true", help="Use real trading environment instead of OKX demo")
     args = p.parse_args()
     cfg = Config()
     cfg.timeframe = args.timeframe
+    cfg.okx_demo = not args.live
     # اسمح بتجاوز الإعدادات من سطر الأوامر
     if args.top is not None: cfg.top_n_symbols = int(args.top)
     if args.quiet is not None: cfg.quiet_windows_utc = tuple(args.quiet)
