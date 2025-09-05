@@ -945,7 +945,12 @@ class Bot:
         if not os.path.exists(self.cfg.trades_csv):
             self.notifier.send(f"📅 Daily Report {date}: No trades")
             return
-        df = pd.read_csv(self.cfg.trades_csv)
+        try:
+            df = pd.read_csv(self.cfg.trades_csv, on_bad_lines="skip")
+        except Exception as e:
+            print(f"error reading {self.cfg.trades_csv}: {e}")
+            self.notifier.send(f"📅 Daily Report {date}: No trades")
+            return
         if df.empty:
             msg = f"📅 Daily Report {date}\nNo trades"
         else:
