@@ -846,7 +846,8 @@ class Bot:
         self.last_time: Dict[str, Optional[dt.datetime]] = {}
         self.last_alert_ts: float = 0.0
         self.closed_trades: List[PaperTrade] = []
-        self.model_state: Dict[str, dict] = self._load_model_state()
+        self.model_state: Dict[str, dict] = {}
+        self.load_model_state()
         self.last_hourly_report = now_utc()
         self.last_daily_report_date = now_utc().date()
 
@@ -894,26 +895,32 @@ class Bot:
             self._send_daily_report(self.last_daily_report_date)
             self.last_daily_report_date = today
 
-    def _load_model_state(self) -> Dict[str, dict]:
-        """Load model performance state from disk."""
+    def load_model_state(self) -> None:
+        """Load model-performance weights from ``state.json``.
+
+        If the file does not exist or parsing fails, ``self.model_state`` is set
+        to an empty dictionary and a warning is printed.  This method is
+        typically called once at startup.
+        """
         try:
             if os.path.exists(self.cfg.state_json):
                 with open(self.cfg.state_json, "r") as f:
                     data = json.load(f)
                     if isinstance(data, dict):
-                        return data
+                        self.model_state = data
+                        return
         except Exception:
-            pass
-        return {}
+            print("[WARN] failed to load model_state; starting fresh")
+        self.model_state = {}
 
-    def _save_model_state(self) -> None:
-        """Persist current model_state to disk."""
+    def save_model_state(self) -> None:
+        """Persist the current :attr:`model_state` dictionary to disk."""
         try:
             ensure_dir(self.cfg.state_json)
             with open(self.cfg.state_json, "w") as f:
                 json.dump(self.model_state, f)
-        except Exception:
-            pass
+        except Exception as e:
+            print("[WARN] failed to save model_state:", e)
 
     def update_model_performance(self, model_name: str, pnl: float, entry: float, sl: float) -> None:
         """Update bandit weights after a trade closes.
@@ -931,7 +938,8 @@ class Bot:
 
         Example
         -------
-        >>> bot.update_model_performance("TREND", pnl=15.0, entry=100.0, sl=95.0)
+        >>> trade = ...  # some closed trade object
+        >>> bot.update_model_performance(trade.model, trade.pnl_usd, trade.entry, trade.sl)
         """
         risk = abs(entry - sl)
         if risk <= 0:
@@ -943,7 +951,7 @@ class Bot:
         decay = getattr(self.cfg, "evolve_decay", 0.95)
         trial_w = getattr(self.cfg, "evolve_trial_weight", 0.05)
         st["w"] = max(0.1, st["w"] * decay + trial_w * R)
-        self._save_model_state()
+        self.save_model_state()
 
     # ==========================================
 
