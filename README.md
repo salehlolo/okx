@@ -172,8 +172,8 @@ class Config:
     # Self-Evolving (محلي — مش بيعتمد على OpenAI)
     evolve_enabled: bool = True
     evolve_mutations_per_round: int = 2
-    evolve_trial_weight: float = 0.25
-    evolve_decay: float = 0.98
+    evolve_trial_weight: float = 0.05
+    evolve_decay: float = 0.95
 
     # ==== الإضافات الجديدة (إدارة المخاطر المتقدمة) ====
     # Confidence Filter
@@ -846,6 +846,7 @@ class Bot:
         self.last_time: Dict[str, Optional[dt.datetime]] = {}
         self.last_alert_ts: float = 0.0
         self.closed_trades: List[PaperTrade] = []
+        self.model_state: Dict[str, dict] = self._load_model_state()
         self.last_hourly_report = now_utc()
         self.last_daily_report_date = now_utc().date()
 
@@ -892,6 +893,57 @@ class Bot:
         if today != self.last_daily_report_date:
             self._send_daily_report(self.last_daily_report_date)
             self.last_daily_report_date = today
+
+    def _load_model_state(self) -> Dict[str, dict]:
+        """Load model performance state from disk."""
+        try:
+            if os.path.exists(self.cfg.state_json):
+                with open(self.cfg.state_json, "r") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        return data
+        except Exception:
+            pass
+        return {}
+
+    def _save_model_state(self) -> None:
+        """Persist current model_state to disk."""
+        try:
+            ensure_dir(self.cfg.state_json)
+            with open(self.cfg.state_json, "w") as f:
+                json.dump(self.model_state, f)
+        except Exception:
+            pass
+
+    def update_model_performance(self, model_name: str, pnl: float, entry: float, sl: float) -> None:
+        """Update bandit weights after a trade closes.
+
+        Parameters
+        ----------
+        model_name: str
+            Identifier of the strategy/model.
+        pnl: float
+            Realized profit or loss in absolute terms.
+        entry: float
+            Trade entry price.
+        sl: float
+            Stop-loss price used to compute risk.
+
+        Example
+        -------
+        >>> bot.update_model_performance("TREND", pnl=15.0, entry=100.0, sl=95.0)
+        """
+        risk = abs(entry - sl)
+        if risk <= 0:
+            return
+        R = pnl / risk
+        st = self.model_state.setdefault(model_name, {"w": 1.0, "r_avg": 0.0, "n": 0})
+        st["n"] += 1
+        st["r_avg"] = 0.9 * st["r_avg"] + 0.1 * R
+        decay = getattr(self.cfg, "evolve_decay", 0.95)
+        trial_w = getattr(self.cfg, "evolve_trial_weight", 0.05)
+        st["w"] = max(0.1, st["w"] * decay + trial_w * R)
+        self._save_model_state()
 
     # ==========================================
 
@@ -955,6 +1007,7 @@ class Bot:
                             f"• Entry: {t.entry:.4f} → Exit: {t.exit_price:.4f}\n"
                             f"• PnL: {t.pnl_usd:+.2f} USDT | Hold: {hold_s}s",
                         )
+                        self.update_model_performance(t.model, float(t.pnl_usd or 0.0), t.entry, t.sl)
                         self.closed_trades.append(t)
             except Exception:
                 continue
