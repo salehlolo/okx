@@ -951,10 +951,11 @@ class Bot:
             print(f"error reading {self.cfg.trades_csv}: {e}")
             self.notifier.send(f"📅 Daily Report {date}: No trades")
             return
+        df['close_time'] = pd.to_datetime(df['close_time'], errors='coerce')
+        df = df.dropna(subset=['close_time'])
         if df.empty:
             msg = f"📅 Daily Report {date}\nNo trades"
         else:
-            df['close_time'] = pd.to_datetime(df['close_time'])
             day_df = df[df['close_time'].dt.date == date]
             if day_df.empty:
                 msg = f"📅 Daily Report {date}\nNo trades"
