@@ -33,9 +33,9 @@ import requests
 # Constants
 # =========================
 
-# Each trade uses 90% of the account balance at 10× leverage
+# Each trade uses a fixed 50 USDT margin at 10× leverage (~500 USDT notional)
 LEVERAGE = 10
-BALANCE_FRACTION = 0.9
+MARGIN_PER_TRADE = 50.0
 
 # =========================
 # Helpers
@@ -1161,11 +1161,7 @@ class Bot:
                         continue
 
                 bal = self.ex.get_balance_usdt()
-                notional_ref = bal * BALANCE_FRACTION * LEVERAGE
-                if notional_ref <= 0:
-                    print(f"[WARN] skipping {symbol}: balance {bal:.2f} USDT is too low")
-                    continue
-
+                notional_ref = MARGIN_PER_TRADE * LEVERAGE
                 base_qty = notional_ref / price
                 mkt = self.ex.x.market(symbol)
                 contract_size = float(mkt.get("contractSize") or 1)
@@ -1174,7 +1170,7 @@ class Bot:
                 base_qty = contract_qty * contract_size
                 notional_ref = base_qty * price
                 req_margin = notional_ref / LEVERAGE
-                if bal < req_margin:
+                if bal < req_margin or req_margin <= 0:
                     print(f"[WARN] skipping {symbol}: need {req_margin:.2f} USDT but only {bal:.2f} available")
                     continue
                 risk = abs(price - sig.sl); reward = abs(sig.tp - price)
