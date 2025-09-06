@@ -33,9 +33,9 @@ import requests
 # Constants
 # =========================
 
-# Each trade uses 90% of the account balance at 10× leverage
+# Each trade uses 50% of the account balance at 10× leverage
 LEVERAGE = 10
-BALANCE_FRACTION = 0.9
+BALANCE_FRACTION = 0.5
 
 # =========================
 # Helpers
