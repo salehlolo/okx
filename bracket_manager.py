@@ -39,11 +39,13 @@ class BracketManager:
             self.ex.create_order(symbol, opp, contract_qty, type="stop", price=sl, params=params)
             self.ex.create_order(symbol, opp, contract_qty, type="take_profit", price=tp, params=params)
             return True
-        except Exception:
+        except Exception as e:
+            # surface the underlying exchange error to aid debugging
+            print(f"[WARN] bracket placement failed: {e}")
             try:
                 self.ex.close_position(symbol, opp, contract_qty)
-            except Exception:
-                pass
+            except Exception as ce:
+                print(f"[WARN] forced close failed: {ce}")
             return False
 
     def trail(self, trade: Any, last_row: Any) -> None:
