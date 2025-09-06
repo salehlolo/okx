@@ -12,7 +12,7 @@ Env:
   (اختياري) CRYPTOPANIC_TOKEN, NEWSAPI_KEY  ← تقدر تسيبهم فاضيين
 """
 
-import os, time, json, argparse, datetime as dt, math
+import os, time, json, argparse, datetime as dt, math, shutil
 from dataclasses import dataclass, asdict
 from typing import Optional, Tuple, List, Dict
 
@@ -693,6 +693,27 @@ class Paper:
         self.ref_equity = ref_equity
         self.open: Dict[str, PaperTrade] = {}
         ensure_dir(cfg.signals_csv); ensure_dir(cfg.trades_csv); ensure_dir(cfg.ml_csv); ensure_dir(cfg.models_csv); ensure_dir(cfg.state_json)
+        cols = [
+            "id","open_time","close_time","symbol","tf","side","entry","exit",
+            "result","model","pnl_usd","hold_sec","ctx_key"
+        ]
+        if os.path.exists(cfg.trades_csv):
+            rotate = False
+            try:
+                with open(cfg.trades_csv, "r", encoding="utf-8") as f:
+                    header = f.readline().strip().split(",")
+                if header != cols:
+                    rotate = True
+            except Exception:
+                rotate = True
+            if rotate:
+                ts = dt.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+                bad = os.path.join(os.path.dirname(cfg.trades_csv), f"trades_log_bad_{ts}.csv")
+                try:
+                    shutil.move(cfg.trades_csv, bad)
+                except Exception:
+                    pass
+                print("[WARN] trades_log.csv rotated due to malformed schema")
         if not os.path.exists(cfg.signals_csv):
             pd.DataFrame(columns=[
                 "time","symbol","tf","price","side","model","tp","sl",
@@ -700,9 +721,7 @@ class Paper:
                 "trend","vol_bucket","ctx_key"
             ]).to_csv(cfg.signals_csv, index=False)
         if not os.path.exists(cfg.trades_csv):
-            pd.DataFrame(columns=[
-                "id","open_time","close_time","symbol","tf","side","entry","exit","result","model","pnl_usd","hold_sec","ctx_key"
-            ]).to_csv(cfg.trades_csv, index=False)
+            pd.DataFrame(columns=cols).to_csv(cfg.trades_csv, index=False)
         if not os.path.exists(cfg.ml_csv):
             pd.DataFrame(columns=[
                 "trade_id","symbol","tf","side","model","open_time","close_time","result","pnl_usd",
