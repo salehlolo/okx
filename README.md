@@ -147,8 +147,7 @@ class Config:
     news_keywords: Tuple[str, ...] = ("ETF","hack","exploit","ban","SEC","lawsuit","fork","upgrade","halving")
 
     # Universe
-    # ==== تعديل #1: تغيير العدد إلى 10 ====
-    top_n_symbols: int = 10
+    top_n_symbols: int = 20
     refresh_universe_minutes: int = 360
     health_refresh_minutes: int = 90
     health_test_limit: int = 50
@@ -393,18 +392,21 @@ class FuturesExchange:
                         has_orders = True
                         break
                 except Exception:
-                    has_orders = True
-                    break
+                    # Ignore failures; assume no orders for that symbol
+                    continue
             # Check positions
             try:
                 positions = self.x.fetch_positions(params={"type": "swap"})
-                for p in positions:
-                    amt = abs(float(p.get("contracts") or p.get("positionAmt") or 0))
-                    if amt > 0:
-                        has_pos = True
-                        break
             except Exception:
-                has_pos = True
+                positions = []
+            for p in positions:
+                try:
+                    amt = abs(float(p.get("contracts") or p.get("positionAmt") or 0))
+                except Exception:
+                    amt = 0.0
+                if amt > 0:
+                    has_pos = True
+                    break
             if not has_orders and not has_pos:
                 return True
             time.sleep(1)
